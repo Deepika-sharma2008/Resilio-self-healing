@@ -164,6 +164,7 @@ router.post('/', async (req, res) => {
 router.get('/', async (req, res) => {
     try {
         const filter = {};
+        filter.isDeleted = { $ne: true };
 
         if (req.query.ingredientId) {
             if (!mongoose.isValidObjectId(req.query.ingredientId)) {
@@ -351,6 +352,77 @@ router.put('/:id', async (req, res) => {
             message: error.code === 11000
                 ? 'A duplicate record was detected.'
                 : error.message
+        });
+    }
+});
+
+// DELETE: Safely remove a depleted batch from the active list.
+// Keep the batch document so movement history remains valid.
+router.delete('/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        if (!mongoose.isValidObjectId(id)) {
+            return res.status(400).json({
+                success: false,
+                message: 'Invalid batch ID.'
+            });
+        }
+
+        const batch = await StockBatch.findById(id);
+
+        if (!batch) {
+            return res.status(404).json({
+                success: false,
+                message: 'Stock batch not found.'
+            });
+        }
+
+        if (batch.isDeleted) {
+            return res.status(200).json({
+                success: true,
+                message: 'Batch has already been removed.'
+            });
+        }
+
+        const remainingQuantity = Number(
+            batch.quantityRemaining ?? batch.quantity ?? 0
+        );
+
+        // Never hide stock that is still available.
+        if (remainingQuantity > 0) {
+            return res.status(409).json({
+                success: false,
+                message:
+                    `Cannot remove this batch because ${remainingQuantity} units remain. ` +
+                    'Use Stock Out first so inventory quantities remain accurate.'
+            });
+        }
+await StockBatch.updateOne(
+    { _id: batch._id },
+    {
+        $set: {
+            isDeleted: true,
+            status: 'INACTIVE'
+        }
+    }
+);
+
+        return res.status(200).json({
+            success: true,
+            message:
+                'Batch removed from the active list. Movement history has been preserved.',
+            data: {
+                _id: batch._id,
+                batchCode: batch.batchCode
+            }
+        });
+    } catch (error) {
+        console.error('Delete stock batch error:', error);
+
+        return res.status(500).json({
+            success: false,
+            message: 'Could not remove the stock batch.'
         });
     }
 });

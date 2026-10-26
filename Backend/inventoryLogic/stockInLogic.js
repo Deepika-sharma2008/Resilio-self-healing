@@ -101,18 +101,18 @@ const stockIn = async (data) => {
             
 const batch = await StockBatch.create(
     [{
-        batchCode,
-        ingredientId,
-        quantity: quantity,
-        quantityReceived: quantity,
-        quantityRemaining: quantity,
-        unitCost,
-        totalCost: quantity * unitCost,
-        supplierId: supplierId || null,
-        receivedDate: receivedDate || new Date(),
-        expiryDate: expiryDate || null,
-        status: 'Available'
-    }],
+    batchCode,
+    ingredientId,
+    quantity: Number(quantity), // Add this required field
+    quantityReceived: Number(quantity),
+    quantityRemaining: Number(quantity),
+    unitCost: Number(unitCost),
+    totalCost: Number(quantity) * Number(unitCost),
+    supplierId: supplierId || null,
+    receivedDate: receivedDate || new Date(),
+    expiryDate: expiryDate || null,
+    status: "ACTIVE"
+}],
     { session }
 );
 

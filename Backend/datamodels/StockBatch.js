@@ -42,16 +42,21 @@ const stockBatchSchema = new mongoose.Schema(
             type: Date,
             default: null
         },
+        isDeleted: {
+    type: Boolean,
+    default: false,
+    index: true
+},
         referenceCode: {
             type: String,
             trim: true,
             default: ''
         },
-        status: {
-            type: String,
-            enum: ['ACTIVE', 'Available', 'Depleted', 'Expired', 'Quarantined'],
-            default: 'ACTIVE'
-        }
+       status: {
+    type: String,
+    enum: ["ACTIVE", "INACTIVE", "EXPIRED"],
+    default: "ACTIVE"
+}
     },
     {
         timestamps: true

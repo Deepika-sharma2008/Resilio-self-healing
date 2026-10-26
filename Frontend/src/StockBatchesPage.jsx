@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useState } from "react";
+import { queueOfflineInventoryOperation } from "./utils/offlineInventoryQueue.js";
 import {
   Search,
   Package,
@@ -296,6 +297,12 @@ function BatchCard({ batch, onEdit, onDelete, deleting }) {
   );
 }
 
+function createOperationId() {
+  return globalThis.crypto?.randomUUID
+    ? globalThis.crypto.randomUUID()
+    : `offline-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
 export default function StockBatchesPage() {
   const [batches, setBatches] = useState([]);
   const [ingredients, setIngredients] = useState([]);
@@ -404,25 +411,30 @@ export default function StockBatchesPage() {
     }));
   };
 
-  const receiveStock = async (event) => {
-    event.preventDefault();
-    setSaving(true);
-    setError("");
-    setNotice("");
+ const receiveStock = async (event) => {
+  event.preventDefault();
 
+  setSaving(true);
+  setError("");
+  setNotice("");
+
+  const operationId = createOperationId();
+
+  const payload = {
+    operationId,
+    movementCode: `OFF-${operationId}`,
+    batchCode: form.batchCode.trim(),
+    ingredientId: form.ingredientId,
+    quantity: Number(form.quantity),
+    unitCost: Number(form.unitCost),
+    supplierId: form.supplierId || null,
+    receivedDate: form.receivedDate || new Date().toISOString(),
+    expiryDate: form.expiryDate || null,
+    referenceCode: form.referenceCode.trim() || null,
+  };
+
+  try {
     try {
-      const payload = {
-        movementCode: `MOV-${Date.now()}`,
-        batchCode: form.batchCode.trim(),
-        ingredientId: form.ingredientId,
-        quantity: Number(form.quantity),
-        unitCost: Number(form.unitCost),
-        supplierId: form.supplierId || null,
-        receivedDate: form.receivedDate || new Date().toISOString(),
-        expiryDate: form.expiryDate || null,
-        referenceCode: form.referenceCode.trim() || null,
-      };
-
       const result = await requestJson(BATCHES_URL, {
         method: "POST",
         body: JSON.stringify(payload),
@@ -430,17 +442,44 @@ export default function StockBatchesPage() {
 
       setNotice(result.message || "Stock received successfully.");
       setModal("");
+
       setForm({
         ...emptyForm,
         receivedDate: new Date().toISOString().slice(0, 10),
       });
+
       await loadData();
-    } catch (err) {
-      setError(err.message || "Could not receive stock.");
-    } finally {
-      setSaving(false);
+    } catch (requestError) {
+      // Queue an operation only when the network is unavailable.
+      // Do not queue ordinary server validation errors.
+      if (!navigator.onLine || requestError instanceof TypeError) {
+        const queuedOperation = queueOfflineInventoryOperation(
+          "stock-in",
+          payload
+        );
+
+        setNotice(
+          `Stock In saved locally. Operation ID: ${queuedOperation.operationId}. Reconnect and use Check & Recover to synchronize it.`
+        );
+
+        setModal("");
+
+        setForm({
+          ...emptyForm,
+          receivedDate: new Date().toISOString().slice(0, 10),
+        });
+
+        return;
+      }
+
+      throw requestError;
     }
-  };
+  } catch (err) {
+    setError(err.message || "Could not receive stock.");
+  } finally {
+    setSaving(false);
+  }
+};
 
   const openReceiveStock = async () => {
   setError("");
@@ -449,23 +488,35 @@ export default function StockBatchesPage() {
   setForm({
     ...emptyForm,
     receivedDate: new Date().toISOString().slice(0, 10),
+    batchCode: navigator.onLine ? "" : "Pending offline sync",
   });
 
   setModal("receive");
 
+  if (!navigator.onLine) {
+    return;
+  }
+
   try {
     const result = await requestJson(`${BATCHES_URL}/next-code`);
 
-    if (result.data?.batchCode) {
-      setForm((previous) => ({
-        ...previous,
-        batchCode: result.data.batchCode,
-      }));
-    } else {
+    if (!result.data?.batchCode) {
       throw new Error("The server did not return a Batch ID.");
     }
+
+    setForm((previous) => ({
+      ...previous,
+      batchCode: result.data.batchCode,
+    }));
   } catch (err) {
-    setError(`Could not generate Batch ID: ${err.message}`);
+    if (!navigator.onLine || err instanceof TypeError) {
+      setForm((previous) => ({
+        ...previous,
+        batchCode: "Pending offline sync",
+      }));
+    } else {
+      setError(`Could not generate Batch ID: ${err.message}`);
+    }
   }
 };
 
@@ -651,35 +702,9 @@ export default function StockBatchesPage() {
             Refresh
           </button>
 
-          <button
+      <button
   type="button"
-  onClick={async () => {
-    setError("");
-    setNotice("");
-
-    setForm({
-      ...emptyForm,
-      receivedDate: new Date().toISOString().slice(0, 10),
-      batchCode: "",
-    });
-
-    setModal("receive");
-
-    try {
-      const result = await requestJson(`${BATCHES_URL}/next-code`);
-
-      if (result.data?.batchCode) {
-        setForm((previous) => ({
-          ...previous,
-          batchCode: result.data.batchCode,
-        }));
-      } else {
-        throw new Error("The server did not return a Batch ID.");
-      }
-    } catch (err) {
-      setError(`Could not generate Batch ID: ${err.message}`);
-    }
-  }}
+  onClick={openReceiveStock}
   className="inline-flex items-center justify-center gap-2 rounded-xl bg-[#2f684b] px-5 py-3 text-sm font-semibold text-white hover:bg-[#24553b]"
 >
   <Plus size={17} />

@@ -9,10 +9,48 @@ const StockBatch = require("../datamodels/StockBatch");
 const StockQuantity = require("../datamodels/StockQuantity");
 const Ingredient = require("../datamodels/Ingredient");
 
+const StockMovement = require("../datamodels/StockMovement");
+
+const { stockIn } = require("../inventoryLogic/stockInLogic");
+const { stockOut } = require("../inventoryLogic/stockOutLogic");
+
+
 const {
   reconcileIngredient,
 } = require("../inventoryLogic/stockReconciliationLogic");
+// Health check must appear before requireAdmin middleware.
+router.get("/offline-inventory/health", (req, res) => {
+    const databaseConnected = mongoose.connection.readyState === 1;
+
+    return res.status(databaseConnected ? 200 : 503).json({
+        success: databaseConnected,
+        backendAvailable: true,
+        databaseConnected,
+        message: databaseConnected
+            ? "Backend and MongoDB are connected."
+            : "Backend is running, but MongoDB is disconnected."
+    });
+});
+
+
+// Health check — place before admin protection
+router.get("/offline-inventory/health", (req, res) => {
+    const databaseConnected = mongoose.connection.readyState === 1;
+
+    return res.status(databaseConnected ? 200 : 503).json({
+        success: databaseConnected,
+        backendAvailable: true,
+        databaseConnected,
+        message: databaseConnected
+            ? "Backend and MongoDB are connected."
+            : "Backend is running, but MongoDB is disconnected."
+    });
+});
+
+
 router.use(requireAdmin);
+
+
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -853,19 +891,22 @@ router.post("/expired-stock", async (req, res) => {
         // Create a temporary batch with an expiry date in the past.
         const yesterday = new Date();
         yesterday.setDate(yesterday.getDate() - 1);
+await StockBatch.create({
+    batchCode: testBatchCode,
+    ingredientId: testIngredientId,
 
-        await StockBatch.create({
-            batchCode: testBatchCode,
-            ingredientId: testIngredientId,
-            quantityReceived: 1,
-            quantityRemaining: 1,
-            unitCost: 1,
-            totalCost: 1,
-            receivedDate: yesterday,
-            expiryDate: yesterday,
-            status: "ACTIVE",
-            expiredQuantity: 0
-        });
+    // Required by your StockBatch schema
+    quantity: 1,
+
+    quantityReceived: 1,
+    quantityRemaining: 1,
+    unitCost: 1,
+    totalCost: 1,
+    receivedDate: yesterday,
+    expiryDate: yesterday,
+    status: "ACTIVE",
+    expiredQuantity: 0
+});
 
         affectedIngredientIds.add(String(testIngredientId));
 
@@ -1166,28 +1207,42 @@ router.post("/expired-stock", async (req, res) => {
 
 
 
+// FAILURE 4: OFFLINE INVENTORY OPERATION RECOVERY
 
-// FAILURE 4: CHECK BACKEND AND DATABASE CONNECTION
-router.get("/offline-inventory/health", (req, res) => {
-    const databaseConnected = mongoose.connection.readyState === 1;
+async function generateOfflineBatchCode() {
+    const [totalCount, numberedBatches] = await Promise.all([
+        StockBatch.countDocuments(),
+        StockBatch.find({
+            batchCode: /^BAT-\d+$/i
+        }).select("batchCode").lean()
+    ]);
 
-    res.status(databaseConnected ? 200 : 503).json({
-        success: databaseConnected,
-        backendAvailable: true,
-        databaseConnected,
-        message: databaseConnected
-            ? "Backend and MongoDB are connected."
-            : "Backend is running, but MongoDB is disconnected."
-    });
-});
+    let highestNumber = 0;
+
+    for (const batch of numberedBatches) {
+        const match = batch.batchCode.match(/^BAT-(\d+)$/i);
+
+        if (match) {
+            highestNumber = Math.max(highestNumber, Number(match[1]));
+        }
+    }
+
+    let nextNumber = Math.max(totalCount, highestNumber) + 1;
+    let batchCode = `BAT-${String(nextNumber).padStart(3, "0")}`;
+
+    while (await StockBatch.exists({ batchCode })) {
+        nextNumber += 1;
+        batchCode = `BAT-${String(nextNumber).padStart(3, "0")}`;
+    }
+
+    return batchCode;
+}
 
 router.post("/offline-inventory/recover", async (req, res) => {
-    const timeline = [];
     const startedAt = Date.now();
-    let streamStarted = false;
-    let testIngredient = null;
-    let originalStock = null;
-    let testMismatchInjected = false;
+    const timeline = [];
+    const processedOperationIds = [];
+    const failures = [];
 
     const progress = (stage, message, details = {}) => {
         sendProgress(res, timeline, stage, message, details);
@@ -1202,279 +1257,280 @@ router.post("/offline-inventory/recover", async (req, res) => {
 
     try {
         beginStream(res);
-        streamStarted = true;
 
-        progress("started", "Starting offline inventory recovery.");
+        progress(
+            "started",
+            "Starting synchronization of pending offline inventory operations."
+        );
 
         if (mongoose.connection.readyState !== 1) {
             throw new Error("MongoDB is disconnected. Reconnect before recovery.");
         }
 
+        const operations = Array.isArray(req.body.pendingOperations)
+    ? req.body.pendingOperations
+    : [];
         progress(
-            "connection_restored",
-            "Database connection is available."
-        );
-
-        testIngredient = await Ingredient.findOne().lean();
-
-        if (!testIngredient) {
-            throw new Error("Add an ingredient before testing Failure 4.");
-        }
-
-        const ingredientId = testIngredient._id;
-
-        // Calculate the correct quantity from usable batches.
-        const now = new Date();
-
-        const batches = await StockBatch.aggregate([
+            "checking_connection",
+            "Backend and MongoDB connection verified.",
             {
-                $match: {
-                    ingredientId: ingredientId,
-                    status: "ACTIVE",
-                    quantityRemaining: { $gt: 0 },
-                    $or: [
-                        { expiryDate: null },
-                        { expiryDate: { $exists: false } },
-                        { expiryDate: { $gt: now } }
-                    ]
-                }
-            },
-            {
-                $group: {
-                    _id: "$ingredientId",
-                    totalQuantity: { $sum: "$quantityRemaining" }
-                }
-            }
-        ]);
-
-        const expectedQuantity = batches.length
-            ? batches[0].totalQuantity
-            : 0;
-
-        originalStock = await StockQuantity.findOne({
-            ingredientId
-        }).lean();
-
-        const originalQuantity = originalStock
-            ? originalStock.totalQuantity
-            : null;
-
-        // Inject a controlled mismatch for this demonstration.
-        const incorrectQuantity = expectedQuantity + 5;
-
-        await StockQuantity.findOneAndUpdate(
-            { ingredientId },
-            {
-                $set: {
-                    totalQuantity: incorrectQuantity,
-                    lastUpdatedAt: new Date()
-                }
-            },
-            {
-                upsert: true,
-                returnDocument: "after",
-                runValidators: true,
-                setDefaultsOnInsert: true
+                backendAvailable: true,
+                databaseConnected: true,
+                pendingOperations: operations.length
             }
         );
 
-        testMismatchInjected = true;
-
-        progress(
-            "injected",
-            "Injected a controlled stock quantity mismatch.",
-            {
-                ingredientName: testIngredient.name,
-                expectedQuantity,
-                incorrectQuantity,
-                difference: 5
-            }
-        );
-
-        await wait(500);
-
-        // Detect the injected mismatch.
-        const currentStock = await StockQuantity.findOne({
-            ingredientId
-        }).lean();
-
-        const mismatchDetected = Boolean(
-            currentStock &&
-            Math.abs(currentStock.totalQuantity - expectedQuantity) > 0.000001
-        );
-
-        if (!mismatchDetected) {
-            throw new Error("The injected stock mismatch was not detected.");
-        }
-
-        progress(
-            "detected",
-            "Inventory inconsistency detected. Stored quantity does not match usable batches.",
-            {
-                storedQuantity: currentStock.totalQuantity,
-                expectedQuantity,
-                mismatchDetected
-            }
-        );
-
-        await wait(500);
-
-        // Repair using the existing self-healing logic.
-        progress(
-            "recovery_started",
-            "Automatic recovery started. Recalculating stock from usable batches."
-        );
-
-        const repairResult = await reconcileIngredient(
-            String(ingredientId)
-        );
-
-        progress(
-            "recovered",
-            repairResult.repaired
-                ? "Stock quantity mismatch repaired automatically."
-                : "Reconciliation completed. Checking the final quantity."
-        );
-
-        // Independently verify the corrected database value.
-        const verifiedStock = await StockQuantity.findOne({
-            ingredientId
-        }).lean();
-
-        const recoveryVerified = Boolean(
-            verifiedStock &&
-            Math.abs(
-                verifiedStock.totalQuantity - expectedQuantity
-            ) <= 0.000001
-        );
-
-        progress(
-            recoveryVerified ? "verification_passed" : "verification_failed",
-            recoveryVerified
-                ? "Verification passed. Stored stock now matches usable batch quantities."
-                : "Verification failed. Stored stock still differs from usable batches.",
-            {
-                expectedQuantity,
-                actualQuantity: verifiedStock
-                    ? verifiedStock.totalQuantity
-                    : null,
-                recoveryVerified
-            }
-        );
-
-        if (!recoveryVerified) {
-            throw new Error("Stock recovery verification failed.");
-        }
-
-        // Restore the original StockQuantity record after the demonstration.
-        progress(
-            "cleanup_started",
-            "Restoring the original stock quantity record after the test."
-        );
-
-        if (originalStock) {
-            await StockQuantity.findOneAndUpdate(
-                { ingredientId },
-                {
-                    $set: {
-                        totalQuantity: originalQuantity,
-                        lastUpdatedAt: originalStock.lastUpdatedAt || new Date()
-                    }
+        if (operations.length === 0) {
+            finish({
+                success: false,
+                recovered: false,
+                completed: true,
+                failureType: "offline-inventory-recovery",
+                message:
+                    "There are no pending operations to synchronize. Queue a Stock In or Stock Out operation while offline, reconnect, and try again.",
+                durationMs: Date.now() - startedAt,
+                timeline,
+                processedOperationIds: [],
+                summary: {
+                    pendingOperations: 0,
+                    synchronizedOperations: 0,
+                    failedOperations: 0,
+                    databaseConnected: true
                 },
-                { runValidators: true }
-            );
-        } else {
-            await StockQuantity.deleteOne({ ingredientId });
+                verification: {
+                    backendAvailable: true,
+                    databaseConnected: true,
+                    recoveryVerified: false
+                }
+            });
+
+            return;
         }
 
-        testMismatchInjected = false;
+        for (const operation of operations) {
+            const operationId = String(operation.operationId || "").trim();
+            const type = String(operation.type || "").toLowerCase();
+            const payload = operation.payload || {};
+
+            if (!operationId) {
+                failures.push({
+                    operationId: null,
+                    message: "An operation is missing its operation ID."
+                });
+                continue;
+            }
+
+            // A stable movement code prevents reapplying an operation
+            // that the backend has already recorded.
+            const movementCode = `OFF-${operationId}`;
+
+            try {
+                progress(
+                    "operation_sync_started",
+                    `Synchronizing ${type} operation ${operationId}.`,
+                    { operationId, operationType: type }
+                );
+
+                const existingMovement = await StockMovement.findOne({
+                    movementCode
+                }).lean();
+
+                if (existingMovement) {
+                    processedOperationIds.push(operationId);
+
+                    progress(
+                        "operation_already_applied",
+                        "This operation was already recorded. It will not be applied again.",
+                        { operationId, movementCode, duplicatePrevented: true }
+                    );
+
+                    continue;
+                }
+
+                const ingredientId = String(payload.ingredientId || "");
+                const quantity = Number(payload.quantity);
+
+                if (!mongoose.Types.ObjectId.isValid(ingredientId)) {
+                    throw new Error("The operation contains an invalid ingredient ID.");
+                }
+
+                if (!Number.isFinite(quantity) || quantity <= 0) {
+                    throw new Error("Operation quantity must be greater than zero.");
+                }
+
+                if (type === "stock-in") {
+                    const unitCost = Number(payload.unitCost);
+
+                    if (!Number.isFinite(unitCost) || unitCost <= 0) {
+                        throw new Error("Stock In requires a unit cost greater than zero.");
+                    }
+
+                    const receivedDate = payload.receivedDate
+                        ? new Date(payload.receivedDate)
+                        : new Date();
+
+                    const expiryDate = payload.expiryDate
+                        ? new Date(payload.expiryDate)
+                        : null;
+
+                    if (Number.isNaN(receivedDate.getTime())) {
+                        throw new Error("Invalid received date.");
+                    }
+
+                    if (expiryDate && Number.isNaN(expiryDate.getTime())) {
+                        throw new Error("Invalid expiry date.");
+                    }
+
+                    if (expiryDate && expiryDate < receivedDate) {
+                        throw new Error("Expiry date cannot be before the received date.");
+                    }
+
+                    if (
+                        payload.supplierId &&
+                        !mongoose.Types.ObjectId.isValid(payload.supplierId)
+                    ) {
+                        throw new Error("Invalid supplier ID.");
+                    }
+
+                    const batchCode = await generateOfflineBatchCode();
+
+                    await stockIn({
+                        batchCode,
+                        movementCode,
+                        ingredientId,
+                        quantity,
+                        unitCost,
+                        supplierId: payload.supplierId || null,
+                        receivedDate,
+                        expiryDate,
+                        referenceCode: payload.referenceCode || ""
+                    });
+                } else if (type === "stock-out") {
+                    await stockOut({
+                        ...payload,
+                        movementCode,
+                        ingredientId,
+                        quantity,
+                        referenceCode: payload.referenceCode || ""
+                    });
+                } else {
+                    throw new Error(
+                        `Unsupported operation type: ${type || "missing type"}.`
+                    );
+                }
+
+                // Verify that the business logic recorded the operation.
+                const savedMovement = await StockMovement.findOne({
+                    movementCode
+                }).lean();
+
+                if (!savedMovement) {
+                    throw new Error(
+                        "The operation was submitted, but its stock movement could not be verified. Check the stock logic before retrying."
+                    );
+                }
+
+                processedOperationIds.push(operationId);
+
+                progress(
+                    "operation_synced",
+                    `${type} operation synchronized and verified.`,
+                    {
+                        operationId,
+                        movementCode,
+                        movementVerified: true
+                    }
+                );
+            } catch (operationError) {
+                console.error(
+                    `Offline operation ${operationId} failed:`,
+                    operationError
+                );
+
+                failures.push({
+                    operationId,
+                    message: operationError.message
+                });
+
+                progress(
+                    "operation_sync_failed",
+                    `Operation ${operationId} could not be synchronized: ${operationError.message}`,
+                    { operationId, operationType: type }
+                );
+            }
+        }
+
+        const allProcessed = failures.length === 0 &&
+            processedOperationIds.length === operations.length;
 
         progress(
-            "cleanup_completed",
-            "Test cleanup completed. Original stock quantity record restored."
+            allProcessed ? "verification_passed" : "verification_failed",
+            allProcessed
+                ? "All pending operations have been synchronized or verified as already applied."
+                : "Some operations could not be synchronized. Those operations remain pending for review.",
+            {
+                submittedOperations: operations.length,
+                synchronizedOperations: processedOperationIds.length,
+                failedOperations: failures.length
+            }
         );
 
         finish({
-            success: true,
-            recovered: true,
+            success: allProcessed,
+            recovered: allProcessed,
             completed: true,
             failureType: "offline-inventory-recovery",
-            message:
-                "Inventory mismatch detected, automatically repaired, verified, and cleaned up successfully.",
+            message: allProcessed
+                ? "Pending inventory operations synchronized and verified successfully."
+                : "Recovery was incomplete. Successfully processed operations were verified; failed operations need attention.",
             durationMs: Date.now() - startedAt,
             timeline,
+            processedOperationIds,
+            failures,
             summary: {
-                failureInjected: true,
-                failureDetected: true,
-                mismatchDetected: true,
+                pendingOperations: operations.length,
+                synchronizedOperations: processedOperationIds.length,
+                failedOperations: failures.length,
                 databaseConnected: true,
-                expectedQuantity,
-                incorrectQuantity,
-                repairedQuantity: verifiedStock.totalQuantity,
-                recoveryVerified: true,
-                cleanupCompleted: true
+                recoveryVerified: allProcessed
             },
             verification: {
-                mismatchDetected: true,
+                backendAvailable: true,
                 databaseConnected: true,
-                quantityMatchesBatches: true,
-                recoveryVerified: true
-            },
-            results: [{
-                ingredientId: String(ingredientId),
-                ingredientName: testIngredient.name,
-                success: true,
-                result: repairResult
-            }]
+                allOperationsProcessed: allProcessed,
+                recoveryVerified: allProcessed
+            }
         });
     } catch (error) {
         console.error("Offline inventory recovery failed:", error);
 
-        // Best-effort restoration if the test injected a mismatch.
-        if (testMismatchInjected && testIngredient && mongoose.connection.readyState === 1) {
-            try {
-                if (originalStock) {
-                    await StockQuantity.findOneAndUpdate(
-                        { ingredientId: testIngredient._id },
-                        {
-                            $set: {
-                                totalQuantity: originalStock.totalQuantity,
-                                lastUpdatedAt: originalStock.lastUpdatedAt || new Date()
-                            }
-                        },
-                        { upsert: true, runValidators: true }
-                    );
-                } else {
-                    await StockQuantity.deleteOne({
-                        ingredientId: testIngredient._id
-                    });
-                }
-            } catch (cleanupError) {
-                console.error("Failure 4 cleanup failed:", cleanupError);
-            }
+        if (!res.headersSent) {
+            return res.status(500).json({
+                success: false,
+                message: error.message || "Offline inventory recovery failed."
+            });
         }
 
-        const result = {
+        finish({
             success: false,
             recovered: false,
-            completed: false,
+            completed: true,
             failureType: "offline-inventory-recovery",
             message: error.message || "Offline inventory recovery failed.",
             durationMs: Date.now() - startedAt,
             timeline,
+            processedOperationIds,
+            failures,
             summary: {
-                failureInjected: testMismatchInjected,
+                synchronizedOperations: processedOperationIds.length,
+                failedOperations: failures.length,
+                databaseConnected: mongoose.connection.readyState === 1
+            },
+            verification: {
+                databaseConnected: mongoose.connection.readyState === 1,
                 recoveryVerified: false
             }
-        };
-
-        if (streamStarted && !res.writableEnded) {
-            progress("recovery_failed", result.message);
-            result.timeline = timeline;
-            finish(result);
-        } else if (!res.headersSent) {
-            res.status(500).json(result);
-        }
+        });
     }
 });
 
